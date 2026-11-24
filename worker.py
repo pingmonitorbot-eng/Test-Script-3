@@ -2,11 +2,13 @@
 """
 TempNumbers worker (GitHub Actions)
 
-1) Playwright login + reload gen-stats (SPA calls /api/gen/sms with CSRF)
-2) Insert NEW rows into shared Mongo as status=pending
-   Fields: number, sender, sms (+ meta). Big bot does OTP/country/Telegram.
+- Playwright login, poll gen-stats every ~15s (same idea as big-bot API panels)
+- Writes NEW SMS to Mongo tempnumbers_inbox as status=pending
+- First poll: if any rows → save only the LATEST; if empty → inject one TEST SMS
+  so the big bot can forward and prove the pipeline works
+- Runs ~5 hours, then hands over to the next workflow run
 
-Never print phone numbers or SMS body in logs (public repo).
+Public logs never print phone numbers or SMS body.
 """
 import hashlib
 import os
@@ -14,7 +16,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
@@ -30,9 +32,10 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "tech_og_bot")
 INBOX_COL = os.getenv("INBOX_COL", "tempnumbers_inbox")
 
+# Match big-bot API panel cadence (~15s); runtime ~5h
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "18000"))
 HANDOVER_SECONDS = int(os.getenv("HANDOVER_SECONDS", "300"))
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "5"))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
 RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
 
 
@@ -47,8 +50,8 @@ def event_hash(number: str, sender: str, sms: str, received_at: str) -> str:
 
 def connect_inbox():
     if not MONGO_URI:
-        raise SystemExit("MONGO_URI is not set")
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+        raise SystemExit("MONGO_URI is not set — add repo Secret MONGO_URI")
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
     client.admin.command("ping")
     col = client[MONGO_DB][INBOX_COL]
     col.create_index([("event_hash", ASCENDING)], unique=True)
@@ -178,6 +181,32 @@ def normalize(raw):
     }
 
 
+def row_sort_key(raw):
+    """Best-effort newest-first (ISO / common datetime strings)."""
+    t = str(raw.get("receivedAt") or raw.get("createdAt") or "")
+    return t
+
+
+def make_test_sms_row():
+    """Synthetic row so big-bot can prove Mongo → Telegram path."""
+    now = datetime.now(timezone.utc)
+    received_at = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Unique each run so unique index allows it
+    code = f"{int(now.timestamp()) % 1000000:06d}"
+    number = "8801700000001"
+    sender = "SYSTEM"
+    sms = f"TempNumbers pipeline TEST. Your code is {code}. Do not share."
+    return {
+        "number": number,
+        "sender": sender,
+        "sms": sms,
+        "received_at": received_at,
+        "range_name": "TEST",
+        "event_hash": event_hash(number, sender, sms, received_at),
+        "is_test": True,
+    }
+
+
 def insert_pending(col, row):
     doc = {
         "number": row["number"],
@@ -191,6 +220,8 @@ def insert_pending(col, row):
         "run_id": RUN_ID,
         "created_at": datetime.now(timezone.utc),
     }
+    if row.get("is_test"):
+        doc["is_test"] = True
     try:
         col.insert_one(doc)
         return True
@@ -204,6 +235,7 @@ def dispatch_next_run():
     repo = os.getenv("GITHUB_REPOSITORY")
     token = os.getenv("NEXT_RUN_TOKEN") or os.getenv("GITHUB_TOKEN")
     if not repo or not token:
+        log("handover skipped (no token/repo)")
         return False
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/"
@@ -227,11 +259,13 @@ def main():
     deadline = started + RUN_SECONDS
     handover_at = deadline - HANDOVER_SECONDS
     handed_over = False
+    first_poll_done = False
 
     client, inbox = connect_inbox()
     log(
         f"worker start run={RUN_ID} user={PANEL_USER} "
-        f"db={MONGO_DB}.{INBOX_COL} runtime={RUN_SECONDS // 60}min"
+        f"db={MONGO_DB}.{INBOX_COL} poll={POLL_SECONDS}s "
+        f"runtime={RUN_SECONDS // 60}min (~5h)"
     )
 
     inserted = polls = errors = 0
@@ -260,15 +294,53 @@ def main():
                 rows = poll_rows(page)
                 polls += 1
                 new_n = 0
-                for raw in rows:
-                    row = normalize(raw)
-                    if not row:
-                        continue
-                    if insert_pending(inbox, row):
-                        new_n += 1
-                        inserted += 1
-                if new_n or polls % 15 == 0:
-                    log(f"poll #{polls}: api_rows={len(rows)} inserted_new={new_n}")
+
+                if not first_poll_done:
+                    first_poll_done = True
+                    normalized = [n for n in (normalize(r) for r in rows) if n]
+                    if normalized:
+                        # newest by receivedAt string (ISO sorts lexicographically)
+                        normalized.sort(
+                            key=lambda r: r.get("received_at") or "", reverse=True
+                        )
+                        latest = normalized[0]
+                        if insert_pending(inbox, latest):
+                            new_n = 1
+                            inserted += 1
+                            log(
+                                f"first poll: api_rows={len(rows)} "
+                                f"→ saved LATEST only (1)"
+                            )
+                        else:
+                            log(
+                                f"first poll: api_rows={len(rows)} "
+                                f"→ latest already in inbox"
+                            )
+                    else:
+                        test_row = make_test_sms_row()
+                        if insert_pending(inbox, test_row):
+                            new_n = 1
+                            inserted += 1
+                            log(
+                                "first poll: no panel data → "
+                                "injected TEST SMS for pipeline check"
+                            )
+                        else:
+                            log("first poll: test SMS insert skipped (dup)")
+                else:
+                    for raw in rows:
+                        row = normalize(raw)
+                        if not row:
+                            continue
+                        if insert_pending(inbox, row):
+                            new_n += 1
+                            inserted += 1
+                    if new_n or polls % 10 == 0:
+                        log(
+                            f"poll #{polls}: api_rows={len(rows)} "
+                            f"inserted_new={new_n} total_inserted={inserted}"
+                        )
+
                 errors = 0
             except Exception as e:
                 errors += 1
@@ -281,15 +353,15 @@ def main():
                         raise
                     except Exception as le:
                         log(f"re-login failed: {le}")
-                if errors >= 20:
+                if errors >= 25:
                     raise SystemExit("too many poll errors")
-                time.sleep(min(30, 2 * errors))
+                time.sleep(min(45, 3 * errors))
 
             if not handed_over and time.time() >= handover_at:
                 handed_over = True
                 dispatch_next_run()
 
-            time.sleep(POLL_SECONDS * random.uniform(0.8, 1.2))
+            time.sleep(POLL_SECONDS * random.uniform(0.9, 1.1))
 
         browser.close()
 

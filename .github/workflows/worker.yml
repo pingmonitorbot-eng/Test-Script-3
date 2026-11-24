@@ -35,7 +35,7 @@ jobs:
           INBOX_COL: tempnumbers_inbox
           NEXT_RUN_TOKEN: ${{ secrets.NEXT_RUN_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          # Production default ~5h; override via repo variable if needed
-          RUN_SECONDS: ${{ vars.RUN_SECONDS || '18000' }}
-          POLL_SECONDS: "5"
+          RUN_SECONDS: "18000"
+          POLL_SECONDS: "15"
+          HANDOVER_SECONDS: "300"
         run: python worker.py
