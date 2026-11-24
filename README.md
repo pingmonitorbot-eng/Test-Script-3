@@ -1,24 +1,15 @@
-# Test-Script-3 — TempNumbers worker
+# TempNumbers worker
 
-GitHub Actions worker:
+Public GA worker → Mongo `tempnumbers_inbox` (`status=pending`).
 
-1. Playwright login (`test_panel`)
-2. Poll `/api/gen/sms` inside the browser session
-3. Optional push to your bot (HMAC signed)
+## Secrets
 
-## Quick test
+| Secret | Required |
+|--------|----------|
+| `PANEL_USER` | yes |
+| `PANEL_PASS` | yes |
+| `MONGO_URI` | yes (same as big bot) |
+| `MONGO_DB` | optional (default `tech_og_bot`) |
+| `NEXT_RUN_TOKEN` | optional PAT for handover |
 
-Actions → **TempNumbers worker** → Run workflow  
-`dry_run` default **1** → nothing sent to bot.
-
-## What you may set later
-
-| Item | Where | Required for |
-|------|--------|----------------|
-| `PANEL_USER` / `PANEL_PASS` | already `test_panel` in code + yml | login |
-| `BOT_URL` | GitHub Secret | LIVE push |
-| `WORKER_SECRET` | GitHub Secret | LIVE push |
-| `NEXT_RUN_TOKEN` | GitHub Secret (PAT) | multi-run handover |
-| `DRY_RUN=0` | workflow input | live mode |
-
-Without `BOT_URL` + `WORKER_SECRET` the worker stays in **DRY-RUN**.
+Never commit credentials.

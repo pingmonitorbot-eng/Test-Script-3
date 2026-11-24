@@ -2,10 +2,6 @@ name: TempNumbers worker
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "1 = test only, nothing is sent to the bot"
-        default: "1"
   schedule:
     - cron: "17 */5 * * *"
 
@@ -23,30 +19,23 @@ jobs:
     timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Playwright
+      - name: Install deps
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
-
       - name: Run worker
         env:
-          # Panel login (also hardcoded as defaults in worker.py)
-          PANEL_USER: test_panel
-          PANEL_PASS: test_panel
-          PANEL_BASE: https://tempnumbers.net
-          # Optional live bot — leave empty for DRY-RUN
-          BOT_URL: ${{ secrets.BOT_URL }}
-          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          PANEL_USER: ${{ secrets.PANEL_USER }}
+          PANEL_PASS: ${{ secrets.PANEL_PASS }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_DB: ${{ secrets.MONGO_DB }}
+          INBOX_COL: tempnumbers_inbox
           NEXT_RUN_TOKEN: ${{ secrets.NEXT_RUN_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          DRY_RUN: ${{ inputs.dry_run || '1' }}
-          # Shorter first test (override in code or set RUN_SECONDS secret later)
-          RUN_SECONDS: "600"
+          # Production default ~5h; override via repo variable if needed
+          RUN_SECONDS: ${{ vars.RUN_SECONDS || '18000' }}
           POLL_SECONDS: "5"
-          WINDOW_MINUTES: "20"
         run: python worker.py
