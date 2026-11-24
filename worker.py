@@ -25,17 +25,17 @@ BASE = os.getenv("PANEL_BASE", "https://tempnumbers.net").rstrip("/")
 LOGIN_URL = f"{BASE}/login"
 TARGET_URL = f"{BASE}/gen-stats"
 
-PANEL_USER = os.getenv("PANEL_USER", "test_panel")
-PANEL_PASS = os.getenv("PANEL_PASS", "test_panel")
+PANEL_USER = (os.getenv("PANEL_USER") or "test_panel").strip()
+PANEL_PASS = (os.getenv("PANEL_PASS") or "test_panel").strip()
 
-MONGO_URI = os.getenv("MONGO_URI", "")
-MONGO_DB = os.getenv("MONGO_DB", "tech_og_bot")
-INBOX_COL = os.getenv("INBOX_COL", "tempnumbers_inbox")
+MONGO_URI = (os.getenv("MONGO_URI") or "").strip()
+# Empty secret becomes "" and must not override default
+MONGO_DB = (os.getenv("MONGO_DB") or "tech_og_bot").strip() or "tech_og_bot"
+INBOX_COL = (os.getenv("INBOX_COL") or "tempnumbers_inbox").strip() or "tempnumbers_inbox"
 
-# Match big-bot API panel cadence (~15s); runtime ~5h
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "18000"))
-HANDOVER_SECONDS = int(os.getenv("HANDOVER_SECONDS", "300"))
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
+RUN_SECONDS = int(os.getenv("RUN_SECONDS") or "18000")
+HANDOVER_SECONDS = int(os.getenv("HANDOVER_SECONDS") or "300")
+POLL_SECONDS = float(os.getenv("POLL_SECONDS") or "15")
 RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
 
 
@@ -51,8 +51,9 @@ def event_hash(number: str, sender: str, sms: str, received_at: str) -> str:
 def connect_inbox():
     if not MONGO_URI:
         raise SystemExit("MONGO_URI is not set — add repo Secret MONGO_URI")
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=15000)
     client.admin.command("ping")
+    log(f"mongo ping OK → db={MONGO_DB!r} col={INBOX_COL!r}")
     col = client[MONGO_DB][INBOX_COL]
     col.create_index([("event_hash", ASCENDING)], unique=True)
     col.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
@@ -181,17 +182,9 @@ def normalize(raw):
     }
 
 
-def row_sort_key(raw):
-    """Best-effort newest-first (ISO / common datetime strings)."""
-    t = str(raw.get("receivedAt") or raw.get("createdAt") or "")
-    return t
-
-
 def make_test_sms_row():
-    """Synthetic row so big-bot can prove Mongo → Telegram path."""
     now = datetime.now(timezone.utc)
     received_at = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    # Unique each run so unique index allows it
     code = f"{int(now.timestamp()) % 1000000:06d}"
     number = "8801700000001"
     sender = "SYSTEM"
@@ -265,7 +258,7 @@ def main():
     log(
         f"worker start run={RUN_ID} user={PANEL_USER} "
         f"db={MONGO_DB}.{INBOX_COL} poll={POLL_SECONDS}s "
-        f"runtime={RUN_SECONDS // 60}min (~5h)"
+        f"runtime={RUN_SECONDS // 60}min"
     )
 
     inserted = polls = errors = 0
@@ -299,7 +292,6 @@ def main():
                     first_poll_done = True
                     normalized = [n for n in (normalize(r) for r in rows) if n]
                     if normalized:
-                        # newest by receivedAt string (ISO sorts lexicographically)
                         normalized.sort(
                             key=lambda r: r.get("received_at") or "", reverse=True
                         )
@@ -307,24 +299,15 @@ def main():
                         if insert_pending(inbox, latest):
                             new_n = 1
                             inserted += 1
-                            log(
-                                f"first poll: api_rows={len(rows)} "
-                                f"→ saved LATEST only (1)"
-                            )
+                            log(f"first poll: api_rows={len(rows)} → saved LATEST only (1)")
                         else:
-                            log(
-                                f"first poll: api_rows={len(rows)} "
-                                f"→ latest already in inbox"
-                            )
+                            log(f"first poll: api_rows={len(rows)} → latest already in inbox")
                     else:
                         test_row = make_test_sms_row()
                         if insert_pending(inbox, test_row):
                             new_n = 1
                             inserted += 1
-                            log(
-                                "first poll: no panel data → "
-                                "injected TEST SMS for pipeline check"
-                            )
+                            log("first poll: no panel data → injected TEST SMS")
                         else:
                             log("first poll: test SMS insert skipped (dup)")
                 else:

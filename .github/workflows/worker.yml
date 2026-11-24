@@ -31,6 +31,7 @@ jobs:
           PANEL_USER: ${{ secrets.PANEL_USER }}
           PANEL_PASS: ${{ secrets.PANEL_PASS }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
+          # If secret empty, worker falls back to tech_og_bot
           MONGO_DB: ${{ secrets.MONGO_DB }}
           INBOX_COL: tempnumbers_inbox
           NEXT_RUN_TOKEN: ${{ secrets.NEXT_RUN_TOKEN }}
