@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-TempNumbers worker — runs inside GitHub Actions.
+TempNumbers worker — GitHub Actions.
 
-Logs in with a real browser, then polls /api/gen/sms from inside the
-logged-in page and pushes NEW SMS to the bot over signed HTTPS.
-
-PUBLIC REPO: never print numbers, SMS text, cookies or password.
+Login with Playwright, poll gen-stats by driving the SPA (Show Report) so the
+panel's own X-CSRF-Token is applied. Never print numbers/SMS/password.
 """
 import hashlib
 import hmac
@@ -17,16 +15,13 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
 import requests
 
-# ───────────────────────── configuration ─────────────────────────
 BASE = os.getenv("PANEL_BASE", "https://tempnumbers.net").rstrip("/")
 LOGIN_URL = f"{BASE}/login"
 TARGET_URL = f"{BASE}/gen-stats"
 
-# Test account (hardcoded for this public test repo)
 PANEL_USER = os.getenv("PANEL_USER", "test_panel")
 PANEL_PASS = os.getenv("PANEL_PASS", "test_panel")
 
@@ -35,11 +30,10 @@ SECRET = os.getenv("WORKER_SECRET", "")
 PANEL_NAME = os.getenv("PANEL_NAME", "TempNumbers")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1" or not (BOT_URL and SECRET)
 
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "18000"))  # 5 hours
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "18000"))
 HANDOVER_SECONDS = int(os.getenv("HANDOVER_SECONDS", "300"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "4"))
 WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", "20"))
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "100"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "30"))
 RELOGIN_MARGIN = timedelta(minutes=20)
 RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
@@ -84,60 +78,12 @@ def sign(secret, timestamp, body):
     ).hexdigest()
 
 
-def time_param(moment, style):
-    if style == "iso":
-        return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    return moment.strftime("%Y-%m-%d %H:%M:%S")
-
-
 def parse_expiry(value, now=None):
     now = now or datetime.now(timezone.utc)
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return now + timedelta(hours=3)
-
-
-class Poller:
-    def __init__(self, api_get):
-        self.api_get = api_get
-        self.style = None
-        self.limit = PAGE_LIMIT
-
-    def _fetch_all(self, page, start, end, style):
-        rows, offset = [], 0
-        for _ in range(10):
-            status, body = self.api_get(
-                page,
-                "/api/gen/sms",
-                {
-                    "from": time_param(start, style),
-                    "to": time_param(end, style),
-                    "limit": self.limit,
-                    "offset": offset,
-                },
-            )
-            if status in (401, 403):
-                raise SessionExpired(f"HTTP {status}")
-            if status != 200 or not isinstance(body, dict) or "rows" not in body:
-                return rows, False
-            batch = body["rows"]
-            rows.extend(batch)
-            offset += len(batch)
-            if len(batch) < self.limit or offset >= int(body.get("total") or 0):
-                break
-        return rows, True
-
-    def fetch(self, page, start, end):
-        for style in ([self.style] if self.style else ["iso", "space"]):
-            rows, ok = self._fetch_all(page, start, end, style)
-            if not ok and self.limit > 20:
-                self.limit = 20
-                rows, ok = self._fetch_all(page, start, end, style)
-            if ok:
-                self.style = style
-                return rows
-        raise PollError("the report API rejected every date format")
 
 
 class Outbox:
@@ -177,7 +123,7 @@ def dispatch_next_run():
     repo = os.getenv("GITHUB_REPOSITORY")
     token = os.getenv("NEXT_RUN_TOKEN") or os.getenv("GITHUB_TOKEN")
     if not repo or not token:
-        log("handover: no repository/token — schedule will start next run")
+        log("handover: no repository/token")
         return False
     response = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/"
@@ -193,43 +139,25 @@ def dispatch_next_run():
         },
         timeout=20,
     )
-    log(f"handover: next run requested → HTTP {response.status_code}")
+    log(f"handover: next run → HTTP {response.status_code}")
     return response.status_code == 204
-
-
-FETCH_JS = """async (url) => {
-  const r = await fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}});
-  return {status: r.status, text: await r.text()};
-}"""
-
-
-def browser_api_get(page, path, params):
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    result = page.evaluate(FETCH_JS, f"{path}?{query}" if query else path)
-    try:
-        body = json.loads(result["text"])
-    except ValueError:
-        body = None
-    return result["status"], body
 
 
 def set_input(page, selector: str, value: str) -> None:
     page.wait_for_selector(selector, state="visible", timeout=30000)
     page.click(selector)
     page.fill(selector, "")
-    page.type(selector, value, delay=20)
+    page.type(selector, value, delay=15)
     page.evaluate(
         """([sel, val]) => {
             const el = document.querySelector(sel);
-            if (!el) return false;
+            if (!el) return;
             const desc = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            );
+                window.HTMLInputElement.prototype, 'value');
             if (desc && desc.set) desc.set.call(el, val);
             else el.value = val;
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-            return el.value;
         }""",
         [selector, value],
     )
@@ -248,34 +176,44 @@ def is_logged_in(page) -> bool:
         body = page.inner_text("body")
         if "Assigned numbers" in body or "Estimated earnings" in body:
             return True
+        if "Gen. SMS" in body or "Generated SMS" in body:
+            return True
     except Exception:
         pass
     return False
 
 
 def login(page):
-    """Real browser login (form is JS-protected)."""
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    page.wait_for_selector("#nl-username, #nl-password, input[type=password]", timeout=30000)
     time.sleep(0.5)
+
+    # already logged in (redirect)
+    if is_logged_in(page):
+        log("already logged in")
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
+        return datetime.now(timezone.utc) + timedelta(hours=3)
+
+    page.wait_for_selector("#nl-username, input[type=password]", timeout=30000)
 
     if page.locator("#nl-username").count():
         set_input(page, "#nl-username", PANEL_USER)
         set_input(page, "#nl-password", PANEL_PASS)
     else:
-        page.locator(
-            "input[autocomplete=username], input[name=username], input[type=text]:visible"
-        ).first.fill(PANEL_USER)
+        page.locator("input[type=text]:visible, input[name=username]").first.fill(
+            PANEL_USER
+        )
         page.locator("input[type=password]").first.fill(PANEL_PASS)
 
     expires = datetime.now(timezone.utc) + timedelta(hours=3)
-    submit = page.locator("button.nl-submit, #nl-submit, button[type=submit]")
+    submit = page.locator("button.nl-submit, button[type=submit]")
     if not submit.count():
-        submit = page.get_by_role("button", name=re.compile(r"sign\s*in|log\s*in|login", re.I))
+        submit = page.get_by_role(
+            "button", name=re.compile(r"sign\s*in|log\s*in", re.I)
+        )
 
     try:
         with page.expect_response(
@@ -293,14 +231,9 @@ def login(page):
         except Exception:
             pass
     except Exception as e:
-        log(f"login response wait: {type(e).__name__}: {e}")
-        # fallback click / Enter
+        log(f"login response: {type(e).__name__}: {e}")
         try:
             submit.first.click()
-        except Exception:
-            pass
-        try:
-            page.locator("#nl-password, input[type=password]").first.press("Enter")
         except Exception:
             pass
 
@@ -310,9 +243,13 @@ def login(page):
         time.sleep(0.5)
     else:
         if not is_logged_in(page):
-            raise RuntimeError(f"login did not leave login page (url={page.url})")
+            raise RuntimeError(f"login stuck url={page.url}")
 
     page.goto(TARGET_URL, wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
     return expires
 
 
@@ -325,8 +262,95 @@ def login_with_retries(page, attempts=3):
             return expires
         except Exception as exc:
             log(f"login attempt {n}/{attempts} failed: {type(exc).__name__}: {exc}")
-            time.sleep(15)
+            time.sleep(10)
     raise SystemExit("login failed 3 times — stopping")
+
+
+def ensure_gen_stats(page):
+    if "gen-stats" not in (page.url or ""):
+        page.goto(TARGET_URL, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        time.sleep(1)
+    if not is_logged_in(page):
+        raise SessionExpired("not on gen-stats / logged out")
+
+
+def poll_via_ui(page, start: datetime, end: datetime):
+    """
+    Drive the SPA: set From/To if possible, click Show Report, capture /api/gen/sms.
+    Uses the panel's own CSRF signing.
+    """
+    ensure_gen_stats(page)
+
+    # Best-effort: fill datetime fields (placeholders vary)
+    from_s = start.strftime("%Y-%m-%d %H:%M:%S")
+    to_s = end.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        inputs = page.locator("input").all()
+        # First two visible text/datetime-like inputs often are From / To
+        filled = 0
+        for inp in inputs:
+            try:
+                if not inp.is_visible():
+                    continue
+                t = (inp.get_attribute("type") or "").lower()
+                ph = (inp.get_attribute("placeholder") or "").lower()
+                if t in ("text", "datetime-local", "") or "date" in ph or not ph:
+                    # skip number/sender search boxes
+                    if "start" in ph or "sender" in ph or "exact" in ph:
+                        continue
+                    if filled == 0:
+                        inp.fill(from_s)
+                        filled = 1
+                    elif filled == 1:
+                        inp.fill(to_s)
+                        filled = 2
+                        break
+            except Exception:
+                continue
+    except Exception as e:
+        log(f"date fill soft-fail: {type(e).__name__}")
+
+    show = page.get_by_role("button", name=re.compile(r"show\s*report", re.I))
+    if not show.count():
+        raise PollError("Show Report button not found")
+
+    try:
+        with page.expect_response(
+            lambda r: "/api/gen/sms" in r.url and r.request.resource_type in (
+                "xhr",
+                "fetch",
+            ),
+            timeout=30000,
+        ) as info:
+            show.first.click()
+        resp = info.value
+        status = resp.status
+        if status in (401, 403):
+            # distinguish CSRF/auth
+            try:
+                body = resp.json()
+                err = str(body.get("error", ""))
+            except Exception:
+                err = ""
+            if err in ("bad_signature",):
+                raise PollError(f"gen/sms bad_signature HTTP {status}")
+            raise SessionExpired(f"gen/sms HTTP {status} {err}")
+        if status != 200:
+            raise PollError(f"gen/sms HTTP {status}")
+        data = resp.json()
+        if not isinstance(data, dict) or "rows" not in data:
+            raise PollError("gen/sms unexpected body shape")
+        return data.get("rows") or []
+    except SessionExpired:
+        raise
+    except PollError:
+        raise
+    except Exception as e:
+        raise PollError(f"poll ui: {type(e).__name__}: {e}") from e
 
 
 def main():
@@ -340,7 +364,7 @@ def main():
         f"user={PANEL_USER} poll={POLL_SECONDS}s window={WINDOW_MINUTES}min "
         f"runtime={RUN_SECONDS // 60}min"
     )
-    seen, outbox, poller = {}, Outbox(), Poller(browser_api_get)
+    seen, outbox = {}, Outbox()
     stats = Counter()
     stop_requested = handed_over = False
     last_heartbeat = 0.0
@@ -372,11 +396,10 @@ def main():
                     log("session ends soon — logging in again")
                     expires = login_with_retries(page)
 
-                rows = poller.fetch(
-                    page,
-                    now_utc - timedelta(minutes=WINDOW_MINUTES),
-                    now_utc + timedelta(minutes=2),
-                )
+                start = now_utc - timedelta(minutes=WINDOW_MINUTES)
+                end = now_utc + timedelta(minutes=2)
+                rows = poll_via_ui(page, start, end)
+
                 fresh, skipped = [], 0
                 for raw in rows:
                     key = row_key(raw)
@@ -389,16 +412,16 @@ def main():
                     row = normalize_row(raw)
                     if row:
                         fresh.append(row)
+
                 stats["polls"] += 1
                 stats["new"] += len(fresh)
                 stats["skipped_status"] += skipped
                 if stats["polls"] == 1:
                     log(
-                        f"first poll: format={poller.style} limit={poller.limit} "
-                        f"rows_in_window={len(rows)} "
+                        f"first poll: rows_in_window={len(rows)} "
                         f"fields={sorted(rows[0].keys()) if rows else '-'}"
                     )
-                if fresh or stats["polls"] % 30 == 0:
+                if fresh or stats["polls"] % 15 == 0:
                     senders = Counter(r["sender"] for r in fresh).most_common(4)
                     log(
                         f"poll #{stats['polls']}: in_window={len(rows)} new={len(fresh)} "
@@ -406,14 +429,15 @@ def main():
                     )
                 outbox.add(fresh)
                 errors_in_a_row = 0
-            except SessionExpired:
-                log("session rejected (401/403) — logging in again")
+
+            except SessionExpired as e:
+                log(f"session issue ({e}) — re-login")
                 expires = login_with_retries(page)
             except Exception as exc:
                 errors_in_a_row += 1
                 log(f"poll error ({errors_in_a_row}): {type(exc).__name__}: {exc}")
                 if errors_in_a_row >= 20:
-                    raise SystemExit("too many poll errors in a row — stopping")
+                    raise SystemExit("too many poll errors — stopping")
                 time.sleep(min(30, 2 * errors_in_a_row))
 
             horizon = time.time() - (WINDOW_MINUTES + 15) * 60
@@ -431,12 +455,9 @@ def main():
                         outbox.done(len(batch))
                         stats["pushed"] += len(batch)
                     else:
-                        log(f"bot answered HTTP {reply.status_code} — will retry")
+                        log(f"bot HTTP {reply.status_code} — retry later")
                 except requests.RequestException as exc:
-                    log(
-                        f"bot unreachable ({type(exc).__name__}) — "
-                        f"{len(outbox.rows)} row(s) waiting"
-                    )
+                    log(f"bot unreachable ({type(exc).__name__})")
             elif DRY_RUN:
                 outbox.rows.clear()
 
@@ -458,7 +479,7 @@ def main():
                         },
                     )
                     if reply.status_code == 200 and reply.json().get("stop"):
-                        log("the bot asked this worker to stop")
+                        log("bot requested stop")
                         stop_requested = True
                 except (requests.RequestException, ValueError):
                     pass
@@ -470,6 +491,7 @@ def main():
             time.sleep(POLL_SECONDS * random.uniform(0.8, 1.2))
 
         browser.close()
+
     log(
         f"worker finished — polls={stats['polls']} new={stats['new']} "
         f"pushed={stats['pushed']} non_ok_skipped={stats['skipped_status']} "
