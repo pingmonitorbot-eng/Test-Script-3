@@ -2,8 +2,9 @@
 """
 TempNumbers worker — GitHub Actions.
 
-Login with Playwright, poll gen-stats by driving the SPA (Show Report) so the
-panel's own X-CSRF-Token is applied. Never print numbers/SMS/password.
+Login with Playwright, stay on gen-stats. Each poll reloads the target page;
+the SPA itself calls /api/gen/sms (with CSRF). We only capture that response.
+No Show Report click needed — same pattern as the successful Test-Script-2 recon.
 """
 import hashlib
 import hmac
@@ -147,7 +148,7 @@ def set_input(page, selector: str, value: str) -> None:
     page.wait_for_selector(selector, state="visible", timeout=30000)
     page.click(selector)
     page.fill(selector, "")
-    page.type(selector, value, delay=15)
+    page.type(selector, value, delay=20)
     page.evaluate(
         """([sel, val]) => {
             const el = document.querySelector(sel);
@@ -158,6 +159,7 @@ def set_input(page, selector: str, value: str) -> None:
             else el.value = val;
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
         }""",
         [selector, value],
     )
@@ -184,72 +186,61 @@ def is_logged_in(page) -> bool:
 
 
 def login(page):
+    """Same hardened approach as successful Test-Script-2 recon."""
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    time.sleep(0.5)
+    time.sleep(0.8)
 
-    # already logged in (redirect)
     if is_logged_in(page):
         log("already logged in")
         page.goto(TARGET_URL, wait_until="domcontentloaded")
         return datetime.now(timezone.utc) + timedelta(hours=3)
 
-    page.wait_for_selector("#nl-username, input[type=password]", timeout=30000)
-
-    if page.locator("#nl-username").count():
-        set_input(page, "#nl-username", PANEL_USER)
-        set_input(page, "#nl-password", PANEL_PASS)
-    else:
-        page.locator("input[type=text]:visible, input[name=username]").first.fill(
-            PANEL_USER
-        )
-        page.locator("input[type=password]").first.fill(PANEL_PASS)
+    page.wait_for_selector("#nl-username", timeout=30000)
+    set_input(page, "#nl-username", PANEL_USER)
+    set_input(page, "#nl-password", PANEL_PASS)
+    log(
+        f"fields username={page.input_value('#nl-username')!r} "
+        f"password_len={len(page.input_value('#nl-password') or '')}"
+    )
 
     expires = datetime.now(timezone.utc) + timedelta(hours=3)
-    submit = page.locator("button.nl-submit, button[type=submit]")
-    if not submit.count():
-        submit = page.get_by_role(
-            "button", name=re.compile(r"sign\s*in|log\s*in", re.I)
-        )
-
+    submitted = False
     try:
         with page.expect_response(
             lambda r: "/api/auth/login" in r.url.split("?")[0], timeout=30000
         ) as info:
-            submit.first.click()
+            page.locator("button.nl-submit, button[type=submit]").first.click()
         response = info.value
         log(f"login API HTTP {response.status}")
         if response.status != 200:
-            raise RuntimeError(f"login rejected (HTTP {response.status})")
+            raise RuntimeError(f"login rejected HTTP {response.status}")
         try:
             data = response.json()
             if data.get("expiresAt"):
                 expires = parse_expiry(data.get("expiresAt"))
         except Exception:
             pass
+        submitted = True
     except Exception as e:
-        log(f"login response: {type(e).__name__}: {e}")
+        log(f"login click/response: {type(e).__name__}: {e}")
+
+    if not submitted:
         try:
-            submit.first.click()
+            page.locator("#nl-password").press("Enter")
         except Exception:
             pass
 
-    for _ in range(40):
+    for i in range(40):
         if is_logged_in(page):
             break
         time.sleep(0.5)
     else:
-        if not is_logged_in(page):
-            raise RuntimeError(f"login stuck url={page.url}")
+        raise RuntimeError(f"login stuck url={page.url}")
 
-    page.goto(TARGET_URL, wait_until="domcontentloaded")
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
     return expires
 
 
@@ -266,91 +257,49 @@ def login_with_retries(page, attempts=3):
     raise SystemExit("login failed 3 times — stopping")
 
 
-def ensure_gen_stats(page):
-    if "gen-stats" not in (page.url or ""):
-        page.goto(TARGET_URL, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        time.sleep(1)
-    if not is_logged_in(page):
-        raise SessionExpired("not on gen-stats / logged out")
-
-
-def poll_via_ui(page, start: datetime, end: datetime):
+def poll_gen_sms(page):
     """
-    Drive the SPA: set From/To if possible, click Show Report, capture /api/gen/sms.
-    Uses the panel's own CSRF signing.
+    Reload gen-stats; SPA auto-calls /api/gen/sms (with CSRF).
+    Capture that response — no button click.
     """
-    ensure_gen_stats(page)
-
-    # Best-effort: fill datetime fields (placeholders vary)
-    from_s = start.strftime("%Y-%m-%d %H:%M:%S")
-    to_s = end.strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        inputs = page.locator("input").all()
-        # First two visible text/datetime-like inputs often are From / To
-        filled = 0
-        for inp in inputs:
-            try:
-                if not inp.is_visible():
-                    continue
-                t = (inp.get_attribute("type") or "").lower()
-                ph = (inp.get_attribute("placeholder") or "").lower()
-                if t in ("text", "datetime-local", "") or "date" in ph or not ph:
-                    # skip number/sender search boxes
-                    if "start" in ph or "sender" in ph or "exact" in ph:
-                        continue
-                    if filled == 0:
-                        inp.fill(from_s)
-                        filled = 1
-                    elif filled == 1:
-                        inp.fill(to_s)
-                        filled = 2
-                        break
-            except Exception:
-                continue
-    except Exception as e:
-        log(f"date fill soft-fail: {type(e).__name__}")
-
-    show = page.get_by_role("button", name=re.compile(r"show\s*report", re.I))
-    if not show.count():
-        raise PollError("Show Report button not found")
+    def match(r):
+        return (
+            "/api/gen/sms" in r.url
+            and r.request.resource_type in ("xhr", "fetch")
+        )
 
     try:
-        with page.expect_response(
-            lambda r: "/api/gen/sms" in r.url and r.request.resource_type in (
-                "xhr",
-                "fetch",
-            ),
-            timeout=30000,
-        ) as info:
-            show.first.click()
+        with page.expect_response(match, timeout=45000) as info:
+            page.goto(TARGET_URL, wait_until="domcontentloaded")
         resp = info.value
-        status = resp.status
-        if status in (401, 403):
-            # distinguish CSRF/auth
-            try:
-                body = resp.json()
-                err = str(body.get("error", ""))
-            except Exception:
-                err = ""
-            if err in ("bad_signature",):
-                raise PollError(f"gen/sms bad_signature HTTP {status}")
-            raise SessionExpired(f"gen/sms HTTP {status} {err}")
-        if status != 200:
-            raise PollError(f"gen/sms HTTP {status}")
-        data = resp.json()
-        if not isinstance(data, dict) or "rows" not in data:
-            raise PollError("gen/sms unexpected body shape")
-        return data.get("rows") or []
-    except SessionExpired:
-        raise
-    except PollError:
-        raise
     except Exception as e:
-        raise PollError(f"poll ui: {type(e).__name__}: {e}") from e
+        # fallback: maybe already on page — soft reload
+        try:
+            with page.expect_response(match, timeout=45000) as info:
+                page.reload(wait_until="domcontentloaded")
+            resp = info.value
+        except Exception as e2:
+            raise PollError(f"no /api/gen/sms response: {type(e2).__name__}: {e2}") from e2
+
+    status = resp.status
+    if status in (401, 403):
+        try:
+            err = str((resp.json() or {}).get("error", ""))
+        except Exception:
+            err = ""
+        if err == "bad_signature":
+            raise PollError("gen/sms bad_signature")
+        raise SessionExpired(f"gen/sms HTTP {status} {err}")
+    if status != 200:
+        raise PollError(f"gen/sms HTTP {status}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise PollError(f"gen/sms not json: {e}") from e
+    if not isinstance(data, dict) or "rows" not in data:
+        raise PollError("gen/sms unexpected shape")
+    return data.get("rows") or []
 
 
 def main():
@@ -373,7 +322,11 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         context = browser.new_context(
             viewport={"width": 1366, "height": 900},
@@ -381,6 +334,7 @@ def main():
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
         )
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -396,9 +350,7 @@ def main():
                     log("session ends soon — logging in again")
                     expires = login_with_retries(page)
 
-                start = now_utc - timedelta(minutes=WINDOW_MINUTES)
-                end = now_utc + timedelta(minutes=2)
-                rows = poll_via_ui(page, start, end)
+                rows = poll_gen_sms(page)
 
                 fresh, skipped = [], 0
                 for raw in rows:
